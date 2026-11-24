@@ -1,0 +1,485 @@
+import asyncio
+import logging
+import os
+import re
+from datetime import datetime, timezone
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+PAYMENT_MODE = os.getenv("PAYMENT_MODE", "FIAT").upper()
+PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN", "")
+CURRENCY = os.getenv("CURRENCY", "UZS").upper()
+
+DB_PATH = "cs2_shop.db"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("cs2_skin_shop")
+
+router = Router()
+
+TRADE_URL_PATTERN = re.compile(
+    r"^https://steamcommunity\.com/tradeoffer/new/\?partner=\d+&token=[a-zA-Z0-9_-]+$"
+)
+
+
+class OrderStates(StatesGroup):
+    waiting_for_trade_url = State()
+
+
+class AdminAddSkinStates(StatesGroup):
+    waiting_for_skin_data = State()
+
+
+# --- База данных ---
+async def init_db() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS skins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                exterior TEXT NOT NULL,
+                float_val TEXT,
+                price INTEGER NOT NULL,
+                in_stock INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                skin_id INTEGER NOT NULL,
+                skin_name TEXT NOT NULL,
+                price INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                trade_url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PAID',
+                charge_id TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        # Добавляем стартовые примеры скинов, если база пустая
+        async with db.execute("SELECT COUNT(*) FROM skins") as cursor:
+            count = (await cursor.fetchone())[0]
+            if count == 0:
+                sample_skins = [
+                    ("AK-47 | Redline", "Field-Tested", "0.24", 220000, 1),
+                    ("AWP | Asiimov", "Field-Tested", "0.28", 1350000, 1),
+                    ("Desert Eagle | Printstream", "Minimal Wear", "0.09", 680000, 1),
+                    ("M4A1-S | Hyper Beast", "Field-Tested", "0.21", 310000, 1),
+                ]
+                await db.executemany(
+                    "INSERT INTO skins (name, exterior, float_val, price, in_stock) VALUES (?, ?, ?, ?, ?)",
+                    sample_skins,
+                )
+        await db.commit()
+
+
+async def get_available_skins() -> list[tuple]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, name, exterior, float_val, price FROM skins WHERE in_stock = 1 ORDER BY id DESC"
+        ) as cursor:
+            return await cursor.fetchall()
+
+
+async def get_skin_by_id(skin_id: int) -> tuple | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, name, exterior, float_val, price, in_stock FROM skins WHERE id = ?",
+            (skin_id,),
+        ) as cursor:
+            return await cursor.fetchone()
+
+
+async def mark_skin_sold(skin_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE skins SET in_stock = 0 WHERE id = ?", (skin_id,))
+        await db.commit()
+
+
+async def create_order(
+    user_id: int,
+    username: str | None,
+    skin_id: int,
+    skin_name: str,
+    price: int,
+    currency: str,
+    trade_url: str,
+    charge_id: str,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO orders (user_id, username, skin_id, skin_name, price, currency, trade_url, status, charge_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'PAID', ?, ?)
+            """,
+            (
+                user_id,
+                username,
+                skin_id,
+                skin_name,
+                price,
+                currency,
+                trade_url,
+                charge_id,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+# --- Клавиатуры ---
+def get_currency_label() -> str:
+    return "⭐ Stars" if PAYMENT_MODE == "STARS" else CURRENCY
+
+
+def build_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔫 Каталог скинов CS2", callback_data="catalog")],
+            [InlineKeyboardButton(text="📦 Мои покупки", callback_data="my_orders")],
+            [InlineKeyboardButton(text="❓ Как получить скин", callback_data="faq")],
+        ]
+    )
+
+
+def build_catalog_keyboard(skins: list[tuple]) -> InlineKeyboardMarkup:
+    label = get_currency_label()
+    rows = []
+    for skin_id, name, exterior, _, price in skins:
+        price_str = f"{price:,}".replace(",", " ")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{name} ({exterior}) — {price_str} {label}",
+                    callback_data=f"skin:{skin_id}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ В главное меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# --- Пользовательские сценарии ---
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "<b>CS2 Skin Market</b>\n\n"
+        "Покупка скинов Counter-Strike 2 с быстрой отправкой через Steam Trade Offer.\n"
+        "Выберите раздел ниже:",
+        reply_markup=build_main_menu(),
+    )
+
+
+@router.callback_query(F.data == "home")
+async def cb_home(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>CS2 Skin Market</b>\n\nВыберите раздел ниже:",
+            reply_markup=build_main_menu(),
+        )
+
+
+@router.callback_query(F.data == "faq")
+async def cb_faq(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            "<b>Как проходит покупка:</b>\n\n"
+            "1. Выбираете скин в каталоге.\n"
+            "2. Вставляете свою <b>Steam Trade URL</b> (инвентарь должен быть открыт).\n"
+            "3. Оплачиваете заказ удобным способом.\n"
+            "4. В течение 5–15 минут получаете обмен в Steam и принимаете скин.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]]
+            ),
+        )
+
+
+@router.callback_query(F.data == "catalog")
+async def cb_catalog(callback: CallbackQuery) -> None:
+    await callback.answer()
+    skins = await get_available_skins()
+    if not callback.message:
+        return
+
+    if not skins:
+        await callback.message.edit_text(
+            "Сейчас все скины раскуплены. Скоро пополним ассортимент!",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]]
+            ),
+        )
+        return
+
+    await callback.message.edit_text(
+        "<b>Доступные скины CS2:</b>\nВыберите предмет для просмотра характеристик и покупки:",
+        reply_markup=build_catalog_keyboard(skins),
+    )
+
+
+@router.callback_query(F.data.startswith("skin:"))
+async def cb_skin_details(callback: CallbackQuery) -> None:
+    skin_id = int(callback.data.split(":")[1])
+    skin = await get_skin_by_id(skin_id)
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    if not skin or skin[5] == 0:
+        await callback.message.edit_text(
+            "Этот скин уже купили.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ В каталог", callback_data="catalog")]]
+            ),
+        )
+        return
+
+    _, name, exterior, float_val, price, _ = skin
+    price_str = f"{price:,}".replace(",", " ")
+    label = get_currency_label()
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Купить за {price_str} {label}", callback_data=f"buy:{skin_id}")],
+            [InlineKeyboardButton(text="⬅️ К списку скинов", callback_data="catalog")],
+        ]
+    )
+
+    await callback.message.edit_text(
+        f"🔫 <b>{name}</b>\n\n"
+        f"• Качество: <b>{exterior}</b>\n"
+        f"• Float: <code>{float_val or 'N/A'}</code>\n"
+        f"• Цена: <b>{price_str} {label}</b>\n\n"
+        f"Для покупки нажмите кнопку ниже и укажите вашу ссылку на обмен Steam.",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("buy:"))
+async def cb_buy_skin(callback: CallbackQuery, state: FSMContext) -> None:
+    skin_id = int(callback.data.split(":")[1])
+    skin = await get_skin_by_id(skin_id)
+    await callback.answer()
+
+    if not skin or skin[5] == 0:
+        if callback.message:
+            await callback.message.edit_text("К сожалению, скин только что забрали.")
+        return
+
+    await state.set_state(OrderStates.waiting_for_trade_url)
+    await state.update_data(skin_id=skin_id)
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"Вы покупаете: <b>{skin[1]} ({skin[2]})</b>\n\n"
+            "Отправьте вашу <b>Steam Trade URL</b> в ответном сообщении.\n"
+            "Пример:\n"
+            "<code>https://steamcommunity.com/tradeoffer/new/?partner=12345678&token=AbCdEfGh</code>",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="catalog")]]
+            ),
+        )
+
+
+@router.message(OrderStates.waiting_for_trade_url)
+async def handle_trade_url(message: Message, state: FSMContext, bot: Bot) -> None:
+    trade_url = (message.text or "").strip()
+    if not TRADE_URL_PATTERN.match(trade_url):
+        await message.answer(
+            "❌ Неверный формат ссылки на обмен.\n"
+            "Скопируйте полную ссылку из настроек приватности инвентаря Steam и отправьте ещё раз:"
+        )
+        return
+
+    data = await state.get_data()
+    skin_id = data.get("skin_id")
+    skin = await get_skin_by_id(skin_id)
+
+    if not skin or skin[5] == 0:
+        await state.clear()
+        await message.answer("Этот скин уже продан. Выберите другой в /start.")
+        return
+
+    await state.clear()
+    _, name, exterior, _, price, _ = skin
+
+    if PAYMENT_MODE == "STARS":
+        currency = "XTR"
+        provider_token = ""
+        invoice_amount = price
+    else:
+        currency = CURRENCY
+        provider_token = PROVIDER_TOKEN
+        invoice_amount = price * 100
+
+    # Передаём skin_id в payload; trade_url сохраняем во временном хранилище или кэше по user_id
+    PENDING_TRADES[message.from_user.id] = (skin_id, trade_url)
+
+    await bot.send_invoice(
+        chat_id=message.chat.id,
+        title=f"{name} ({exterior})",
+        description=f"Покупка скина CS2. Отправка на указанный Steam Trade URL.",
+        payload=f"skin_order:{skin_id}",
+        provider_token=provider_token,
+        currency=currency,
+        prices=[LabeledPrice(label=name, amount=invoice_amount)],
+    )
+
+
+PENDING_TRADES: dict[int, tuple[int, str]] = {}
+
+
+@router.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery) -> None:
+    user_id = pre_checkout_query.from_user.id
+    pending = PENDING_TRADES.get(user_id)
+    if not pending:
+        await pre_checkout_query.answer(ok=False, error_message="Сессия заказа истекла. Начните заново.")
+        return
+
+    skin = await get_skin_by_id(pending[0])
+    if not skin or skin[5] == 0:
+        await pre_checkout_query.answer(ok=False, error_message="Скин только что купили.")
+        return
+
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message, bot: Bot) -> None:
+    payment = message.successful_payment
+    user = message.from_user
+    if not payment or not user:
+        return
+
+    pending = PENDING_TRADES.pop(user.id, None)
+    skin_id = int(payment.invoice_payload.split(":")[1])
+    trade_url = pending[1] if pending else "Не указан"
+
+    skin = await get_skin_by_id(skin_id)
+    skin_name = f"{skin[1]} ({skin[2]})" if skin else f"Skin #{skin_id}"
+
+    await mark_skin_sold(skin_id)
+
+    is_stars = payment.currency == "XTR"
+    real_price = payment.total_amount if is_stars else payment.total_amount // 100
+    display_curr = "Stars" if is_stars else payment.currency
+
+    order_id = await create_order(
+        user_id=user.id,
+        username=user.username,
+        skin_id=skin_id,
+        skin_name=skin_name,
+        price=real_price,
+        currency=display_curr,
+        trade_url=trade_url,
+        charge_id=payment.telegram_payment_charge_id,
+    )
+
+    await message.answer(
+        f"✅ <b>Оплата прошла! Заказ #{order_id} оформлен.</b>\n\n"
+        f"🔫 Предмет: <b>{skin_name}</b>\n"
+        f"🔗 Trade URL: <code>{trade_url}</code>\n\n"
+        f"Продавец уже получил уведомление и скоро отправит трейд в Steam.",
+        reply_markup=build_main_menu(),
+    )
+
+    if ADMIN_ID:
+        buyer_tag = f"@{user.username}" if user.username else f"ID: {user.id}"
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🚨 <b>НОВЫЙ ЗАКАЗ #{order_id} (CS2)!</b>\n\n"
+                f"🔫 Скин: <b>{skin_name}</b>\n"
+                f"💰 Оплачено: <b>{real_price:,} {display_curr}</b>\n"
+                f"👤 Покупатель: {user.full_name} ({buyer_tag})\n"
+                f"🔗 <b>Trade URL для отправки:</b>\n{trade_url}".replace(",", " "),
+            )
+        except Exception as e:
+            logger.warning("Ошибка уведомления админа: %s", e)
+
+
+@router.callback_query(F.data == "my_orders")
+async def cb_my_orders(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if not callback.message or not callback.from_user:
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, skin_name, price, currency, status FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+            (callback.from_user.id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        text = "У вас пока нет покупок."
+    else:
+        lines = [
+            f"• Заказ <b>#{oid}</b>: {sname} — {price:,} {curr} [{status}]".replace(",", " ")
+            for oid, sname, price, curr, status in rows
+        ]
+        text = "<b>Ваши последние заказы:</b>\n\n" + "\n".join(lines)
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]]
+        ),
+    )
+
+
+# --- Админ-команда для добавления нового скина ---
+@router.message(Command("addskin"))
+async def cmd_add_skin(message: Message, state: FSMContext) -> None:
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+
+    await state.set_state(AdminAddSkinStates.waiting_for_skin_data)
+    await message.answer(
+        "Отправьте данные нового скина в формате:\n"
+        "<code>Название | Качество | Float | Цена</code>\n\n"
+        "Пример:\n"
+        "<code>AK-47 | Slate | Minimal Wear | 0.11 | 95000</code>"
+    )
+
+
+@router.message(AdminAddSkinStates.waiting_for_skin_data)
+async def handle_add_skin(message: Message, state: FSMContext) -> None:
+    parts = [p.strip() for p in (message.text or "").split("|")]
+    if len(parts) != 4 or not parts[3].isdigit():
+        
+        
